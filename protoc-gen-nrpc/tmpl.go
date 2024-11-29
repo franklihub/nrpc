@@ -12,7 +12,9 @@ import (
 	"context"
 	"log"
 	"time"
-
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/protobuf/proto"
 	"github.com/nats-io/nats.go"
 	{{- range  GetExtraImports .}}
@@ -21,7 +23,7 @@ import (
 	{{- if Prometheus}}
 	"github.com/prometheus/client_golang/prometheus"
 	{{- end}}
-	"github.com/nats-rpc/nrpc"
+	"github.com/franklihub/nrpc"
 )
 
 {{- range .Service}}
@@ -531,6 +533,7 @@ func (c *{{$serviceName}}Client) {{.GetName}}(
 {{- else}}
 
 func (c *{{$serviceName}}Client) {{.GetName}}(
+	ctx context.Context, 
 	{{- range GetMethodSubjectParams . -}}
 	{{ . }} string, {{ end -}}
 	{{- if ne .GetInputType ".nrpc.Void" -}}
@@ -551,13 +554,29 @@ func (c *{{$serviceName}}Client) {{.GetName}}(
 		c.SvcParam{{.}} + "." + {{end -}}
 	"{{GetMethodSubject .}}"
 	{{- range GetMethodSubjectParams . }} + "." + {{ . }}{{ end }}
-
+	////
+	// otel trace
+	tr := otel.GetTracerProvider().Tracer(
+		"nrpc-trace",
+		trace.WithInstrumentationVersion("v0.0.1"),
+	)
+	ctx, span := tr.Start(ctx, subject, trace.WithSpanKind(trace.SpanKindClient))
+	defer span.End()
+	span.SetAttributes(nrpc.CommonLabels()...)
+	// call msg
+	rawRequest, _ := nrpc.Marshal(c.Encoding, req)
+	reqMsg := nats.NewMsg(subject)
+	reqMsg.Data = rawRequest
+	// Inject tracing content into  header.
+	otel.GetTextMapPropagator().Inject(ctx, propagation.HeaderCarrier(reqMsg.Header))
+	////
 	// call
 	{{- if eq .GetInputType ".nrpc.Void"}}
 	var req = &{{GoType .GetInputType}}{}
 	{{- end}}
 	var resp = {{GoType $resultType}}{}
-	if err := nrpc.Call(req, &resp, c.nc, subject, c.Encoding, c.Timeout); err != nil {
+	// if err := nrpc.Call(req, &resp, c.nc, subject, c.Encoding, c.Timeout); err != nil {
+	if err := nrpc.CallMsg(ctx, reqMsg, &resp, c.nc, subject, c.Encoding, c.Timeout); err != nil {
 {{- if Prometheus}}
 		clientCallsFor{{$serviceName}}.WithLabelValues(
 			"{{.GetName}}", c.Encoding, "call_fail").Inc()

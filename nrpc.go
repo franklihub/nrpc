@@ -7,12 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
+	"os"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel/attribute"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
 	jsonpb "google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
@@ -28,13 +33,114 @@ type ContextKey int
 // ErrStreamInvalidMsgCount is when a stream reply gets a wrong number of messages
 var ErrStreamInvalidMsgCount = errors.New("Stream reply received an incorrect number of messages")
 
+const (
+	tracingCommonKeyIpIntranet = `ip.intranet`
+	tracingCommonKeyIpHostname = `hostname`
+)
+
+func IsIntranet(ip string) bool {
+	if ip == "127.0.0.1" {
+		return true
+	}
+	array := strings.Split(ip, ".")
+	if len(array) != 4 {
+		return false
+	}
+	// A
+	if array[0] == "10" || (array[0] == "192" && array[1] == "168") {
+		return true
+	}
+	// C
+	if array[0] == "192" && array[1] == "168" {
+		return true
+	}
+	// B
+	if array[0] == "172" {
+		second, err := strconv.ParseInt(array[1], 10, 64)
+		if err != nil {
+			return false
+		}
+		if second >= 16 && second <= 31 {
+			return true
+		}
+	}
+	return false
+}
+
+func GetIntranetIpArray() (ips []string, err error) {
+	var (
+		addresses  []net.Addr
+		interFaces []net.Interface
+	)
+	interFaces, err = net.Interfaces()
+	if err != nil {
+		return ips, err
+	}
+	for _, interFace := range interFaces {
+		if interFace.Flags&net.FlagUp == 0 {
+			// interface down
+			continue
+		}
+		if interFace.Flags&net.FlagLoopback != 0 {
+			// loop back interface
+			continue
+		}
+		// ignore warden bridge
+		if strings.HasPrefix(interFace.Name, "w-") {
+			continue
+		}
+		addresses, err = interFace.Addrs()
+		if err != nil {
+			return ips, err
+		}
+		for _, addr := range addresses {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			ip = ip.To4()
+			if ip == nil {
+				// not an ipv4 address
+				continue
+			}
+			ipStr := ip.String()
+			if IsIntranet(ipStr) {
+				ips = append(ips, ipStr)
+			}
+		}
+	}
+	return ips, nil
+}
+
+var (
+	hostname, _    = os.Hostname()
+	intranetIps, _ = GetIntranetIpArray()
+	intranetIpStr  = strings.Join(intranetIps, ",")
+)
+
+func CommonLabels() []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.String(tracingCommonKeyIpHostname, hostname),
+		attribute.String(tracingCommonKeyIpIntranet, intranetIpStr),
+		semconv.HostName(hostname),
+	}
+}
+
 //go:generate protoc --go_out=. --go_opt=paths=source_relative nrpc.proto
 
 type NatsConn interface {
 	Publish(subj string, data []byte) error
+	PublishMsg(m *nats.Msg) error
 	PublishRequest(subj, reply string, data []byte) error
 	Request(subj string, data []byte, timeout time.Duration) (*nats.Msg, error)
-
+	RequestMsg(msg *nats.Msg, timeout time.Duration) (*nats.Msg, error)
 	ChanSubscribe(subj string, ch chan *nats.Msg) (*nats.Subscription, error)
 	Subscribe(subj string, handler nats.MsgHandler) (*nats.Subscription, error)
 	SubscribeSync(subj string) (*nats.Subscription, error)
@@ -209,6 +315,33 @@ func ParseSubjectTail(
 		panic("Got extra tokens, which should be impossible at this point")
 	}
 	return
+}
+func CallMsg(ctx context.Context, reqMsg *nats.Msg, rep proto.Message, nc NatsConn, subject string, encoding string, timeout time.Duration) error {
+	// call
+	if _, noreply := rep.(*NoReply); noreply {
+		err := nc.PublishMsg(reqMsg)
+		if err != nil {
+			log.Printf("nrpc: nats publish failed: %v", err)
+		}
+		return err
+	}
+	///
+	msg, err := nc.RequestMsg(reqMsg, timeout)
+	if err != nil {
+		log.Printf("nrpc: nats request failed: %v", err)
+		return err
+	}
+
+	data := msg.Data
+
+	if err := UnmarshalResponse(encoding, data, rep); err != nil {
+		if _, isError := err.(*Error); !isError {
+			log.Printf("nrpc: response unmarshal failed: %v", err)
+		}
+		return err
+	}
+
+	return nil
 }
 
 func Call(req proto.Message, rep proto.Message, nc NatsConn, subject string, encoding string, timeout time.Duration) error {
