@@ -263,6 +263,28 @@ func (h *{{.GetName}}Handler) Handler(msg *nats.Msg) {
 				return nil, err
 			}
 			{{- else }}
+
+			ctx := context.Background()
+			ctx = context.WithValue(ctx, "tracingMiddlewareHandled", 1)
+			var (
+				span trace.Span
+				tr   = otel.GetTracerProvider().Tracer(
+					"nrpc-trace",
+					trace.WithInstrumentationVersion("v0.0.1"),
+				)
+			)
+			ctx, span = tr.Start(
+				otel.GetTextMapPropagator().Extract(
+					ctx,
+					propagation.HeaderCarrier(msg.Header),
+				),
+				msg.Subject,
+				trace.WithSpanKind(trace.SpanKindServer),
+			)
+			span.SetAttributes(nrpc.CommonLabels()...)
+			// Inject tracing context.
+			request.Context = ctx
+			/////
 			request.Handler = func(ctx context.Context)(proto.Message, error){
 				{{- if eq .GetOutputType ".nrpc.NoReply" -}}
 				var innerResp = &nrpc.NoReply{}
